@@ -24,6 +24,10 @@ DEFAULT_H0_KM_S_MPC = 70.0
 DEFAULT_H0_PC_INV = DEFAULT_H0_KM_S_MPC / (
     SPEED_OF_LIGHT_KM_S * PARSECS_PER_MEGAPARSEC
 )
+LOW_Z_SIGMA_CLIP_THRESHOLD = 3.0
+LOW_Z_SIGMA_CLIP_MAX_ITER = 5
+COSMO_SIGMA_CLIP_THRESHOLD = 3.0
+COSMO_SIGMA_CLIP_MAX_ITER = 5
 
 
 def load_modulus_data(csv_path: Path = DATA_PATH) -> np.ndarray:
@@ -132,6 +136,94 @@ def fit_hubble_constant(
     h0 = popt[0]
     h0_err = float(np.sqrt(np.diag(pcov))[0]) if pcov.size else float("nan")
     return h0, h0_err
+
+
+def _residual_scale(residuals: np.ndarray) -> float:
+    """Return a robust scale estimate (std with MAD fallback)."""
+    residuals = np.asarray(residuals, dtype=float)
+    if residuals.size == 0:
+        return float("nan")
+    if residuals.size > 1:
+        std = np.std(residuals, ddof=1)
+        if np.isfinite(std) and std > 0:
+            return std
+    median = np.median(residuals)
+    mad = np.median(np.abs(residuals - median))
+    scale = 1.4826 * mad
+    return scale if np.isfinite(scale) and scale > 0 else float("nan")
+
+
+def _sigma_clip_outliers(
+    redshift: np.ndarray,
+    distance: np.ndarray,
+    distance_error: np.ndarray,
+    valid_mask: np.ndarray,
+    model_predictor,
+    min_required_points: int,
+    sigma_threshold: float,
+    max_iterations: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Generic iterative sigma clipper that removes large-residual data points.
+
+    Parameters
+    ----------
+    redshift, distance, distance_error : arrays of equal length.
+    valid_mask : boolean array indicating which rows are eligible for clipping.
+    model_predictor : callable taking (z, d, err) subsets and returning model
+        distances for those redshifts.
+    min_required_points : int
+        Stop if fewer than this many points remain.
+    """
+
+    redshift = np.asarray(redshift, dtype=float)
+    distance = np.asarray(distance, dtype=float)
+    distance_error = np.asarray(distance_error, dtype=float)
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+
+    if redshift.shape != valid_mask.shape:
+        raise ValueError("valid_mask must match the shape of redshift.")
+
+    keep_mask = valid_mask.copy()
+    outlier_mask = np.zeros_like(valid_mask, dtype=bool)
+
+    if np.count_nonzero(keep_mask) < max(min_required_points, 1):
+        return keep_mask, outlier_mask
+
+    sigma_threshold = float(sigma_threshold)
+    if sigma_threshold <= 0:
+        raise ValueError("sigma_threshold must be positive.")
+    max_iterations = max(1, int(max_iterations))
+    min_required_points = max(1, int(min_required_points))
+
+    for _ in range(max_iterations):
+        idx = np.where(keep_mask)[0]
+        if idx.size < min_required_points:
+            break
+        try:
+            model = model_predictor(
+                redshift[idx],
+                distance[idx],
+                distance_error[idx],
+            )
+        except Exception:
+            break
+
+        residuals = distance[idx] - model
+        scale = _residual_scale(residuals)
+        if not np.isfinite(scale) or scale <= 0:
+            break
+
+        standardized = residuals / scale
+        flagged = np.abs(standardized) > sigma_threshold
+        if not np.any(flagged):
+            break
+
+        flagged_indices = idx[flagged]
+        keep_mask[flagged_indices] = False
+        outlier_mask[flagged_indices] = True
+
+    return keep_mask, outlier_mask
 
 
 def luminosity_distance_flat(
@@ -267,12 +359,13 @@ def plot_modulus_vs_redshift(
         modulus,
         yerr=modulus_error,
         fmt="o",
-        markersize=4,
+        markersize=3,
         color="tab:blue",
         ecolor="tab:gray",
         elinewidth=1,
         capsize=3,
         linestyle="none",
+        alpha=0.65,
     )
     ax.set_xlabel("Redshift (z)")
     ax.set_ylabel("Distance Modulus (mag)")
@@ -294,8 +387,9 @@ def plot_distance_vs_redshift(
     best_fit_h0_error: float | None = None,
     best_fit_h0_km_s_mpc: float | None = None,
     best_fit_h0_km_s_mpc_error: float | None = None,
+    rejected_points: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> None:
-    """Plot physical distance vs redshift and, if possible, the fit residuals."""
+    """Plot physical distance vs redshift, residuals, and optional outliers."""
     show_fit = best_fit_h0 is not None and len(redshift) > 1
     if show_fit:
         fig, (ax, ax_resid) = plt.subplots(
@@ -321,6 +415,24 @@ def plot_distance_vs_redshift(
         capsize=3,
         linestyle="none",
     )
+
+    if rejected_points is not None:
+        rej_z, rej_d, rej_err = rejected_points
+        if len(rej_z):
+            ax.errorbar(
+                rej_z,
+                rej_d,
+                yerr=rej_err,
+                fmt="x",
+                markersize=5,
+                color="tab:red",
+                ecolor="tab:red",
+                elinewidth=1,
+                capsize=2,
+                linestyle="none",
+                label=rf"Rejected (>{LOW_Z_SIGMA_CLIP_THRESHOLD:.0f}$\sigma$)",
+                alpha=0.85,
+            )
 
     model_at_data = None
     chi_sq_red = float("nan")
@@ -357,7 +469,6 @@ def plot_distance_vs_redshift(
             linestyle="--",
             label="\n".join(label_lines),
         )
-        ax.legend()
 
     if show_fit and ax_resid is not None and model_at_data is not None:
         residuals = distance - model_at_data
@@ -387,6 +498,9 @@ def plot_distance_vs_redshift(
     ax.grid(True, which="both", alpha=0.3)
     if show_fit:
         ax.tick_params(labelbottom=False)
+    handles, _ = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend()
     fig.tight_layout()
     fig.savefig(output_path, format="pdf")
     plt.close(fig)
@@ -400,21 +514,44 @@ def plot_cosmological_modulus_fit(
     omega_lambda: float,
     hubble_constant_pc_inv: float,
     output_path: Path,
+    rejected_points: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> None:
-    """Plot distance modulus with best-fit Ω parameters over the data."""
+    """
+    Plot distance modulus with best-fit Ω parameters, reference models,
+    and optional highlighted outliers.
+    """
     fig, ax = plt.subplots(figsize=(7, 5))
     ax.errorbar(
         redshift,
         modulus,
         yerr=modulus_error,
         fmt="o",
-        markersize=4,
+        markersize=2.5,
         color="tab:green",
         ecolor="tab:gray",
         elinewidth=1,
         capsize=3,
         linestyle="none",
+        alpha=0.55,
     )
+
+    if rejected_points is not None:
+        rej_z, rej_mod, rej_err = rejected_points
+        if len(rej_z):
+            ax.errorbar(
+                rej_z,
+                rej_mod,
+                yerr=rej_err,
+                fmt="x",
+                markersize=4,
+                color="tab:red",
+                ecolor="tab:red",
+                elinewidth=1,
+                capsize=2,
+                linestyle="none",
+                label=rf"Rejected (>{COSMO_SIGMA_CLIP_THRESHOLD:.0f}$\sigma$)",
+                alpha=0.85,
+            )
 
     if len(redshift) >= 2:
         z_grid = np.linspace(np.min(redshift), np.max(redshift), 400)
@@ -447,13 +584,53 @@ def plot_cosmological_modulus_fit(
         )
         if np.isfinite(chi_sq_red):
             label_lines.append(rf"$\chi^2_\nu = {chi_sq_red:.2f}$")
-        ax.plot(z_grid, model_modulus, color="black", linewidth=2, label="\n".join(label_lines))
-        ax.legend()
+        ax.plot(
+            z_grid,
+            model_modulus,
+            color="black",
+            linewidth=2,
+            label="\n".join(label_lines),
+        )
+
+        hypothetical_pairs = [
+            (1.0, 0.0, r"(1, 0)"),
+            (0.5, 0.5, r"(0.5, 0.5)"),
+            (0.0, 1.0, r"(0, 1)"),
+        ]
+        styles = [
+            ("tab:red", "--"),
+            ("tab:purple", ":"),
+            ("tab:orange", "-."),
+        ]
+        for (omega_m_ref, omega_lambda_ref, label_suffix), (color, style) in zip(
+            hypothetical_pairs, styles
+        ):
+            try:
+                ref_distance = predict_luminosity_distance(
+                    z_grid,
+                    omega_m_ref,
+                    omega_lambda_ref,
+                    hubble_constant_pc_inv,
+                )
+                ref_modulus = distance_to_modulus(ref_distance)
+            except ValueError:
+                continue
+            ax.plot(
+                z_grid,
+                ref_modulus,
+                color=color,
+                linestyle=style,
+                linewidth=1.2,
+                label=rf"$(\Omega_M,\Omega_\Lambda) = {label_suffix}$",
+            )
 
     ax.set_xlabel("Redshift (z)")
     ax.set_ylabel("Distance Modulus (mag)")
     ax.set_title("Distance Modulus vs. Redshift with Cosmological Fit")
     ax.grid(True, which="both", alpha=0.3)
+    handles, _ = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(output_path, format="pdf")
     plt.close(fig)
@@ -500,48 +677,117 @@ def main() -> None:
         low_d = distances[low_z_mask]
         low_d_err = distance_errors[low_z_mask]
 
-        try:
-            best_fit_h0, best_fit_h0_err = fit_hubble_constant(
-                low_z,
-                low_d,
-                low_d_err,
-            )
-            best_fit_h0_km_s_mpc, best_fit_h0_km_s_mpc_err = to_km_s_per_mpc(
-                best_fit_h0,
-                best_fit_h0_err,
-            )
-            print(
-                "Best-fit H0 for low-z subset: "
-                f"{best_fit_h0:.3e} pc^-1 "
-                f"(± {best_fit_h0_err:.3e}) -> "
-                f"{best_fit_h0_km_s_mpc:.2f} km s^-1 Mpc^-1"
-                + (
-                    f" ± {best_fit_h0_km_s_mpc_err:.2f}"
-                    if best_fit_h0_km_s_mpc_err is not None
-                    else ""
-                )
-            )
-        except Exception as exc:  # pragma: no cover - user data dependent
-            best_fit_h0 = None
-            best_fit_h0_err = None
-            best_fit_h0_km_s_mpc = None
-            best_fit_h0_km_s_mpc_err = None
-            print(f"Could not fit H0 for low-z subset: {exc}")
+        low_valid_mask = (
+            np.isfinite(low_z)
+            & np.isfinite(low_d)
+            & np.isfinite(low_d_err)
+            & (low_d_err >= 0.0)
+        )
 
-        plot_distance_vs_redshift(
+        def _low_z_model(
+            z_subset: np.ndarray,
+            d_subset: np.ndarray,
+            err_subset: np.ndarray,
+        ) -> np.ndarray:
+            h0, _ = fit_hubble_constant(z_subset, d_subset, err_subset)
+            return hubble_law(z_subset, h0)
+
+        inlier_mask, outlier_mask = _sigma_clip_outliers(
             low_z,
             low_d,
             low_d_err,
-            LOW_Z_PLOT_OUTPUT_PATH,
-            best_fit_h0=best_fit_h0,
-            best_fit_h0_error=best_fit_h0_err,
-            best_fit_h0_km_s_mpc=best_fit_h0_km_s_mpc,
-            best_fit_h0_km_s_mpc_error=best_fit_h0_km_s_mpc_err,
+            low_valid_mask,
+            _low_z_model,
+            min_required_points=2,
+            sigma_threshold=LOW_Z_SIGMA_CLIP_THRESHOLD,
+            max_iterations=LOW_Z_SIGMA_CLIP_MAX_ITER,
         )
-        print(
-            f"Saved low-z (< {LOW_Z_THRESHOLD}) distance plot to "
-            f"{LOW_Z_PLOT_OUTPUT_PATH.resolve()}"
-        )
+        valid_mask = inlier_mask | outlier_mask
+        if not np.any(valid_mask):
+            print(
+                "No finite low-z entries survived quality checks; "
+                "skipping low-z fit and plot."
+            )
+        else:
+            filtered_low_z = low_z[inlier_mask]
+            filtered_low_d = low_d[inlier_mask]
+            filtered_low_d_err = low_d_err[inlier_mask]
+            num_outliers = int(np.count_nonzero(outlier_mask))
+            rejected_points = None
+
+            if filtered_low_z.size >= 2:
+                if num_outliers:
+                    rejected_points = (
+                        low_z[outlier_mask],
+                        low_d[outlier_mask],
+                        low_d_err[outlier_mask],
+                    )
+                    print(
+                        f"Removed {num_outliers} low-z outlier(s) "
+                        f"using {LOW_Z_SIGMA_CLIP_THRESHOLD:.0f}σ residual clipping."
+                    )
+            else:
+                filtered_low_z = low_z[valid_mask]
+                filtered_low_d = low_d[valid_mask]
+                filtered_low_d_err = low_d_err[valid_mask]
+                rejected_points = None
+                if num_outliers:
+                    print(
+                        "Not enough low-z points after clipping; "
+                        "using all valid measurements for the H0 fit instead."
+                    )
+
+            try:
+                best_fit_h0, best_fit_h0_err = fit_hubble_constant(
+                    filtered_low_z,
+                    filtered_low_d,
+                    filtered_low_d_err,
+                )
+                best_fit_h0_km_s_mpc, best_fit_h0_km_s_mpc_err = to_km_s_per_mpc(
+                    best_fit_h0,
+                    best_fit_h0_err,
+                )
+                print(
+                    "Best-fit H0 for low-z subset: "
+                    f"{best_fit_h0:.3e} pc^-1 "
+                    f"(± {best_fit_h0_err:.3e}) -> "
+                    f"{best_fit_h0_km_s_mpc:.2f} km s^-1 Mpc^-1"
+                    + (
+                        f" ± {best_fit_h0_km_s_mpc_err:.2f}"
+                        if best_fit_h0_km_s_mpc_err is not None
+                        else ""
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - user data dependent
+                best_fit_h0 = None
+                best_fit_h0_err = None
+                best_fit_h0_km_s_mpc = None
+                best_fit_h0_km_s_mpc_err = None
+                print(f"Could not fit H0 for low-z subset: {exc}")
+
+            if best_fit_h0 is not None:
+                plot_distance_vs_redshift(
+                    filtered_low_z,
+                    filtered_low_d,
+                    filtered_low_d_err,
+                    LOW_Z_PLOT_OUTPUT_PATH,
+                    best_fit_h0=best_fit_h0,
+                    best_fit_h0_error=best_fit_h0_err,
+                    best_fit_h0_km_s_mpc=best_fit_h0_km_s_mpc,
+                    best_fit_h0_km_s_mpc_error=best_fit_h0_km_s_mpc_err,
+                    rejected_points=rejected_points,
+                )
+            else:
+                plot_distance_vs_redshift(
+                    filtered_low_z,
+                    filtered_low_d,
+                    filtered_low_d_err,
+                    LOW_Z_PLOT_OUTPUT_PATH,
+                )
+            print(
+                f"Saved low-z (< {LOW_Z_THRESHOLD}) distance plot to "
+                f"{LOW_Z_PLOT_OUTPUT_PATH.resolve()}"
+            )
     else:
         print(
             f"No entries below redshift {LOW_Z_THRESHOLD}; "
@@ -558,11 +804,91 @@ def main() -> None:
             "(converted to pc^-1) for cosmological optimization."
         )
 
+    cosmo_valid_mask = (
+        np.isfinite(redshift)
+        & np.isfinite(distances)
+        & np.isfinite(distance_errors)
+        & (redshift >= 0.0)
+        & (distances > 0.0)
+        & (distance_errors >= 0.0)
+    )
+
+    def _cosmo_model(
+        z_subset: np.ndarray,
+        d_subset: np.ndarray,
+        err_subset: np.ndarray,
+    ) -> np.ndarray:
+        omega_m, omega_lambda, _ = fit_density_parameters(
+            z_subset,
+            d_subset,
+            err_subset,
+            h0_for_cosmo,
+        )
+        return predict_luminosity_distance(
+            z_subset,
+            omega_m,
+            omega_lambda,
+            h0_for_cosmo,
+        )
+
     try:
-        omega_m_fit, omega_lambda_fit, _ = fit_density_parameters(
+        cosmo_inlier_mask, cosmo_outlier_mask = _sigma_clip_outliers(
             redshift,
             distances,
             distance_errors,
+            cosmo_valid_mask,
+            _cosmo_model,
+            min_required_points=3,
+            sigma_threshold=COSMO_SIGMA_CLIP_THRESHOLD,
+            max_iterations=COSMO_SIGMA_CLIP_MAX_ITER,
+        )
+    except Exception as exc:  # pragma: no cover - user data dependent
+        print(f"Could not run cosmological sigma clipping: {exc}")
+        cosmo_inlier_mask = cosmo_valid_mask.copy()
+        cosmo_outlier_mask = np.zeros_like(redshift, dtype=bool)
+
+    cosmo_valid_mask_combined = cosmo_inlier_mask | cosmo_outlier_mask
+    if not np.any(cosmo_valid_mask_combined):
+        raise RuntimeError("No valid entries available for cosmological fit.")
+
+    cosmo_filtered_mask = cosmo_inlier_mask.copy()
+    num_cosmo_inliers = int(np.count_nonzero(cosmo_filtered_mask))
+    num_cosmo_outliers = int(np.count_nonzero(cosmo_outlier_mask))
+    use_all_cosmo_data = False
+
+    if num_cosmo_inliers < 3:
+        cosmo_filtered_mask = cosmo_valid_mask_combined
+        use_all_cosmo_data = True
+        if num_cosmo_outliers:
+            print(
+                "Not enough cosmological points after clipping; "
+                "using all valid entries for the Ω fit instead."
+            )
+        num_cosmo_outliers = 0
+
+    cosmo_rejected_points = None
+    if num_cosmo_outliers and not use_all_cosmo_data:
+        cosmo_rejected_points = (
+            redshift[cosmo_outlier_mask],
+            modulus[cosmo_outlier_mask],
+            modulus_error[cosmo_outlier_mask],
+        )
+        print(
+            f"Removed {num_cosmo_outliers} cosmological outlier(s) "
+            f"using {COSMO_SIGMA_CLIP_THRESHOLD:.0f}σ residual clipping."
+        )
+
+    filtered_redshift = redshift[cosmo_filtered_mask]
+    filtered_distances = distances[cosmo_filtered_mask]
+    filtered_distance_errors = distance_errors[cosmo_filtered_mask]
+    filtered_modulus = modulus[cosmo_filtered_mask]
+    filtered_modulus_error = modulus_error[cosmo_filtered_mask]
+
+    try:
+        omega_m_fit, omega_lambda_fit, _ = fit_density_parameters(
+            filtered_redshift,
+            filtered_distances,
+            filtered_distance_errors,
             h0_for_cosmo,
         )
         print(
@@ -570,13 +896,14 @@ def main() -> None:
             f"Ω_M = {omega_m_fit:.3f}, Ω_Λ = {omega_lambda_fit:.3f}"
         )
         plot_cosmological_modulus_fit(
-            redshift,
-            modulus,
-            modulus_error,
+            filtered_redshift,
+            filtered_modulus,
+            filtered_modulus_error,
             omega_m_fit,
             omega_lambda_fit,
             h0_for_cosmo,
             COSMO_MODULUS_PLOT_OUTPUT_PATH,
+            rejected_points=cosmo_rejected_points,
         )
         print(
             "Saved cosmological distance-modulus plot to "
