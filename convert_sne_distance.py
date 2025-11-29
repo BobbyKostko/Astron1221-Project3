@@ -63,6 +63,46 @@ def hubble_law(redshift: np.ndarray, hubble_constant: float) -> np.ndarray:
     return redshift / hubble_constant
 
 
+def reduced_chi_squared(
+    observed: np.ndarray,
+    model: np.ndarray,
+    sigma: np.ndarray,
+    n_params: int,
+) -> float:
+    """Compute reduced χ² with basic handling of invalid uncertainties."""
+    if n_params < 0:
+        raise ValueError("Number of fit parameters must be non-negative.")
+
+    observed = np.asarray(observed, dtype=float)
+    model = np.asarray(model, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+
+    finite_sigma = sigma[(sigma > 0) & np.isfinite(sigma)]
+    fallback_sigma = np.median(finite_sigma) if finite_sigma.size else 1.0
+    if not np.isfinite(fallback_sigma) or fallback_sigma <= 0:
+        fallback_sigma = 1.0
+    sigma = np.where(
+        (sigma > 0) & np.isfinite(sigma),
+        sigma,
+        fallback_sigma,
+    )
+
+    mask = np.isfinite(observed) & np.isfinite(model)
+    if not np.any(mask):
+        return float("nan")
+
+    observed = observed[mask]
+    model = model[mask]
+    sigma = sigma[mask]
+
+    dof = len(observed) - n_params
+    if dof <= 0:
+        return float("nan")
+
+    chi_squared = np.sum(((observed - model) / sigma) ** 2)
+    return chi_squared / dof
+
+
 def fit_hubble_constant(
     redshift: np.ndarray,
     distance: np.ndarray,
@@ -255,8 +295,20 @@ def plot_distance_vs_redshift(
     best_fit_h0_km_s_mpc: float | None = None,
     best_fit_h0_km_s_mpc_error: float | None = None,
 ) -> None:
-    """Plot physical distance (with uncertainties) vs redshift."""
-    fig, ax = plt.subplots(figsize=(7, 5))
+    """Plot physical distance vs redshift and, if possible, the fit residuals."""
+    show_fit = best_fit_h0 is not None and len(redshift) > 1
+    if show_fit:
+        fig, (ax, ax_resid) = plt.subplots(
+            2,
+            1,
+            sharex=True,
+            figsize=(7, 7),
+            gridspec_kw={"height_ratios": [3, 1], "hspace": 0.05},
+        )
+    else:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax_resid = None
+
     ax.errorbar(
         redshift,
         distance,
@@ -270,7 +322,9 @@ def plot_distance_vs_redshift(
         linestyle="none",
     )
 
-    if best_fit_h0 is not None and len(redshift) > 1:
+    model_at_data = None
+    chi_sq_red = float("nan")
+    if show_fit:
         z_grid = np.linspace(np.min(redshift), np.max(redshift), 200)
         d_grid = hubble_law(z_grid, best_fit_h0)
         label_lines = [r"$D = z / H_0$ fit"]
@@ -286,16 +340,53 @@ def plot_distance_vs_redshift(
             label_lines.append(km_line)
         else:
             label_lines.append(f"H0 = {best_fit_h0:.3e} pc$^{{-1}}$")
+        model_at_data = hubble_law(redshift, best_fit_h0)
+        chi_sq_red = reduced_chi_squared(
+            distance,
+            model_at_data,
+            distance_error,
+            n_params=1,
+        )
+        if np.isfinite(chi_sq_red):
+            label_lines.append(rf"$\chi^2_\nu = {chi_sq_red:.2f}$")
 
-        ax.plot(z_grid, d_grid, color="black", linestyle="--", label="\n".join(label_lines))
+        ax.plot(
+            z_grid,
+            d_grid,
+            color="black",
+            linestyle="--",
+            label="\n".join(label_lines),
+        )
         ax.legend()
 
-    ax.set_xlabel("Redshift (z)")
+    if show_fit and ax_resid is not None and model_at_data is not None:
+        residuals = distance - model_at_data
+        ax_resid.errorbar(
+            redshift,
+            residuals,
+            yerr=distance_error,
+            fmt="o",
+            markersize=4,
+            color="tab:purple",
+            ecolor="tab:gray",
+            elinewidth=1,
+            capsize=3,
+            linestyle="none",
+        )
+        ax_resid.axhline(0.0, color="black", linestyle="--", linewidth=1)
+        ax_resid.set_ylabel("Residual (pc)")
+        ax_resid.grid(True, which="both", alpha=0.3)
+        ax_resid.set_xlabel("Redshift (z)")
+    else:
+        ax.set_xlabel("Redshift (z)")
+
     ax.set_ylabel("Distance (pc)")
     ax.set_title(
         f"Distance vs. Redshift (subset of {len(redshift)} low-z entries)"
     )
     ax.grid(True, which="both", alpha=0.3)
+    if show_fit:
+        ax.tick_params(labelbottom=False)
     fig.tight_layout()
     fig.savefig(output_path, format="pdf")
     plt.close(fig)
@@ -334,6 +425,13 @@ def plot_cosmological_modulus_fit(
             hubble_constant_pc_inv,
         )
         model_modulus = distance_to_modulus(model_distance)
+        model_distance_data = predict_luminosity_distance(
+            redshift,
+            omega_m,
+            omega_lambda,
+            hubble_constant_pc_inv,
+        )
+        model_modulus_data = distance_to_modulus(model_distance_data)
         label_lines = [
             r"Best-fit cosmological $\mu(z)$",
             rf"$\Omega_M = {omega_m:.3f}$",
@@ -341,6 +439,14 @@ def plot_cosmological_modulus_fit(
         ]
         h0_km_s_mpc, _ = to_km_s_per_mpc(hubble_constant_pc_inv, None)
         label_lines.append(rf"$H_0 = {h0_km_s_mpc:.2f}$ km s$^{{-1}}$ Mpc$^{{-1}}$")
+        chi_sq_red = reduced_chi_squared(
+            modulus,
+            model_modulus_data,
+            modulus_error,
+            n_params=2,
+        )
+        if np.isfinite(chi_sq_red):
+            label_lines.append(rf"$\chi^2_\nu = {chi_sq_red:.2f}$")
         ax.plot(z_grid, model_modulus, color="black", linewidth=2, label="\n".join(label_lines))
         ax.legend()
 
