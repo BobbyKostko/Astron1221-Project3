@@ -1,12 +1,9 @@
 from __future__ import annotations
-
 from pathlib import Path
-
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy
 from scipy import integrate, optimize
-
 
 DATA_PATH = Path(__file__).with_name("SNe data.csv")
 PLOT_OUTPUT_PATH = Path(__file__).with_name("modulus_vs_redshift.pdf")
@@ -275,7 +272,7 @@ def fit_density_parameters(
     distance: np.ndarray,
     distance_error: np.ndarray,
     hubble_constant_pc_inv: float,
-) -> tuple[float, float, optimize.OptimizeResult]:
+) -> tuple[float, float]:
     """Fit Ω_M and Ω_Λ by minimizing residuals between data and d_L(z)."""
     if hubble_constant_pc_inv is None or hubble_constant_pc_inv <= 0:
         raise ValueError("Need a positive H0 (in pc^-1) to fit densities.")
@@ -331,7 +328,7 @@ def fit_density_parameters(
     if not result.success:
         raise RuntimeError(f"Cosmological fit did not converge: {result.message}")
     omega_m_fit, omega_lambda_fit = result.x
-    return omega_m_fit, omega_lambda_fit, result
+    return omega_m_fit, omega_lambda_fit
 
 
 def to_km_s_per_mpc(
@@ -526,13 +523,12 @@ def plot_cosmological_modulus_fit(
         modulus,
         yerr=modulus_error,
         fmt="o",
-        markersize=2.5,
+        markersize=2,
         color="tab:green",
         ecolor="tab:gray",
         elinewidth=1,
-        capsize=3,
         linestyle="none",
-        alpha=0.55,
+        alpha=0.67,
     )
 
     if rejected_points is not None:
@@ -638,24 +634,24 @@ def plot_cosmological_modulus_fit(
 
 def main() -> None:
     data = load_modulus_data()
-    subset = data[: min(len(data), PLOT_ENTRY_LIMIT)]
+    subset = data[:PLOT_ENTRY_LIMIT]
     if len(subset) == 0:
         raise RuntimeError("No supernova data available to process.")
 
-    distances, distance_errors = modulus_to_distance(
-        subset["Distance_Modulus"],
-        subset["Distance_Modulus_Error"],
-    )
-    redshift = subset["Redshift"]
     modulus = subset["Distance_Modulus"]
     modulus_error = subset["Distance_Modulus_Error"]
+    redshift = subset["Redshift"]
+    distances, distance_errors = modulus_to_distance(
+        modulus,
+        modulus_error,
+    )
 
     print(f"Loaded {len(data)} supernovae using SciPy {scipy.__version__}.")
     print(f"Plotting first {len(subset)} entries to {PLOT_OUTPUT_PATH.name}.")
     print("First entry as a quick check:")
     print(
         f"{subset['Supernova_Name'][0]} | "
-        f"μ = {subset['Distance_Modulus'][0]:.3f} ± {subset['Distance_Modulus_Error'][0]:.3f} -> "
+        f"μ = {modulus[0]:.3f} ± {modulus_error[0]:.3f} -> "
         f"d = {distances[0]:.3e} ± {distance_errors[0]:.3e} pc"
     )
     plot_modulus_vs_redshift(
@@ -702,8 +698,7 @@ def main() -> None:
             sigma_threshold=LOW_Z_SIGMA_CLIP_THRESHOLD,
             max_iterations=LOW_Z_SIGMA_CLIP_MAX_ITER,
         )
-        valid_mask = inlier_mask | outlier_mask
-        if not np.any(valid_mask):
+        if not np.any(low_valid_mask):
             print(
                 "No finite low-z entries survived quality checks; "
                 "skipping low-z fit and plot."
@@ -727,9 +722,9 @@ def main() -> None:
                         f"using {LOW_Z_SIGMA_CLIP_THRESHOLD:.0f}σ residual clipping."
                     )
             else:
-                filtered_low_z = low_z[valid_mask]
-                filtered_low_d = low_d[valid_mask]
-                filtered_low_d_err = low_d_err[valid_mask]
+                filtered_low_z = low_z[low_valid_mask]
+                filtered_low_d = low_d[low_valid_mask]
+                filtered_low_d_err = low_d_err[low_valid_mask]
                 rejected_points = None
                 if num_outliers:
                     print(
@@ -818,7 +813,7 @@ def main() -> None:
         d_subset: np.ndarray,
         err_subset: np.ndarray,
     ) -> np.ndarray:
-        omega_m, omega_lambda, _ = fit_density_parameters(
+        omega_m, omega_lambda = fit_density_parameters(
             z_subset,
             d_subset,
             err_subset,
@@ -847,8 +842,7 @@ def main() -> None:
         cosmo_inlier_mask = cosmo_valid_mask.copy()
         cosmo_outlier_mask = np.zeros_like(redshift, dtype=bool)
 
-    cosmo_valid_mask_combined = cosmo_inlier_mask | cosmo_outlier_mask
-    if not np.any(cosmo_valid_mask_combined):
+    if not np.any(cosmo_valid_mask):
         raise RuntimeError("No valid entries available for cosmological fit.")
 
     cosmo_filtered_mask = cosmo_inlier_mask.copy()
@@ -857,7 +851,7 @@ def main() -> None:
     use_all_cosmo_data = False
 
     if num_cosmo_inliers < 3:
-        cosmo_filtered_mask = cosmo_valid_mask_combined
+        cosmo_filtered_mask = cosmo_valid_mask
         use_all_cosmo_data = True
         if num_cosmo_outliers:
             print(
@@ -885,7 +879,7 @@ def main() -> None:
     filtered_modulus_error = modulus_error[cosmo_filtered_mask]
 
     try:
-        omega_m_fit, omega_lambda_fit, _ = fit_density_parameters(
+        omega_m_fit, omega_lambda_fit = fit_density_parameters(
             filtered_redshift,
             filtered_distances,
             filtered_distance_errors,
